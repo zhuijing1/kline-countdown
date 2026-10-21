@@ -4,6 +4,14 @@
 
 不做行情接入、不下单、不管账户。启动后没有主窗口，只在桌面右下角显示一个可拖动的小角标。
 
+## 下载（不想装 Python 就用这个）
+
+[**KlineCountdown-1.0.0.exe**](https://github.com/zhuijing1/kline-countdown/releases/download/v1.0.0/KlineCountdown-1.0.0.exe)
+— 11.1 MB，单文件、免安装，Windows 10/11 64 位双击即用（Python 运行时、Tcl/Tk、VC 运行库都已内置）。
+
+> 下载后如果 SmartScreen 提示"未知发布者"，点「更多信息 → 仍要运行」（没有代码签名证书都会这样）。
+> 也可在 [Releases 页面](https://github.com/zhuijing1/kline-countdown/releases) 查看所有版本。
+
 ---
 
 ## 一、运行

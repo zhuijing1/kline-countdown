@@ -105,6 +105,21 @@ class TestTextRender(unittest.TestCase):
                     self.assertLessEqual(abs(b - a), 2)
         self.assertGreater(partial, 50, "应该有明显的抗锯齿边缘")
 
+    def test_edges_have_many_alpha_levels(self):
+        """超采样后边缘必须是 256 级渐变。
+
+        GDI 自己的灰度抗锯齿只有 ~16 级覆盖率，72px 的字放大看是一圈毛刺；
+        4 倍超采样 + HALFTONE 降回后应有大量不同的半透明档位。
+        """
+        width, height, data = render(transparent=True, fg="#FFFFFF", bg="#000000", radius=0, opacity=1.0)
+        levels = {
+            data[(y * width + x) * 4 + 3]
+            for y in range(height)
+            for x in range(width)
+            if 0 < data[(y * width + x) * 4 + 3] < 255
+        }
+        self.assertGreater(len(levels), 60, f"边缘档位太少（{len(levels)} 级），超采样可能没生效")
+
     def test_solid_background_fills_corners(self):
         width, height, data = render(transparent=False, fg="#FFFFFF", bg="#1B1B1F", radius=0, opacity=1.0)
         b, g, r, a = pixel(data, width, 0, 0)

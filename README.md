@@ -6,7 +6,7 @@
 
 ## 下载（不想装 Python 就用这个）
 
-[**KlineCountdown-1.1.0.exe**](https://github.com/zhuijing1/kline-countdown/releases/download/v1.1.0/KlineCountdown-1.1.0.exe)
+[**KlineCountdown-1.1.1.exe**](https://github.com/zhuijing1/kline-countdown/releases/download/v1.1.1/KlineCountdown-1.1.1.exe)
 — 11.1 MB，单文件、免安装，Windows 10/11 64 位双击即用（Python 运行时、Tcl/Tk、VC 运行库都已内置）。
 
 > 下载后如果 SmartScreen 提示"未知发布者"，点「更多信息 → 仍要运行」（没有代码签名证书都会这样）。
@@ -247,6 +247,11 @@
 > 只能靠描边去盖。现在改成**逐像素 alpha**（`UpdateLayeredWindow`），
 > 边缘是真正的半透明像素，和任何壁纸自然融合，描边这层补丁就不需要了。
 > 实测白底上零黑边（最暗像素就是文字色本身）。
+>
+> **边缘为什么这么平滑**：GDI 自带的灰度抗锯齿只有 ~16 级覆盖率，72px 的数字放大看
+> 就是一圈台阶。所以先把字按 **4 倍字号**画进一张大位图，再用 `StretchBlt(HALFTONE)`
+> 做区域平均缩回来——覆盖率变成 256 级（实测 213 档），墨量只差 3%，单次重绘 7 ms。
+> 任何一步失败都会自动退回 1 倍渲染，角标不会空着。
 
 ### 想要「透明背景、只有数字」怎么做
 1. 交易时段页 → 点主周期后面的 **⚙**

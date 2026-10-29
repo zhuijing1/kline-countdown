@@ -3,7 +3,7 @@
 - 版本：v1.0（未打包，源码运行）
 - 测试日期：2026-10-21
 - 测试环境：Windows（会话分辨率 1536×864 / 125% 缩放），Python 3.13.12，Tk 8.6
-- 结论：**自动化 76 项全部通过**；验收测试 A–E 全部符合预期；运行期发现并修复 2 个缺陷（详见第五节）。
+- 结论：**自动化 94 项全部通过**；验收测试 A–E 全部符合预期；运行期发现并修复 2 个缺陷（详见第五节）。
 
 ---
 
@@ -11,7 +11,7 @@
 
 ```
 python -m unittest discover -s tests
-Ran 76 tests in 0.51s
+Ran 94 tests in 0.58s
 OK
 ```
 
@@ -21,6 +21,7 @@ OK
 | `tests/test_integration.py` | 8 | 逐秒时间轴端到端（A/B/C/E、跨日） |
 | `tests/test_reminders.py` | 14 | 提醒去重、换线重置、恢复不补响、时钟回拨、改阈值后重新触发 |
 | `tests/test_store.py` | 18 | 持久化、损坏兜底、多配置隔离、图标、格式化 |
+| `tests/test_timeframes.py` | 17 | 多周期接管、静默、仲裁、校验、方案切换、v1→v2 迁移 |
 | `tests/test_badge_render.py` | 10 | 角标渲染：逐像素 alpha、抗锯齿边缘无黑边、圆角、透明度、两种闪烁方式 |
 
 ---
@@ -155,8 +156,8 @@ OK
 `docs/badge.png`：13:04:06 时角标贴在任务栏上方右下角，显示 `00:54`，且已进入 60 秒提醒态（红底白字），
 与「5 分钟周期、13:05:00 边界」的计算完全吻合。
 
-其余截图：`docs/menu.png`（右键菜单）、`docs/settings-profiles.png` / `settings-appearance.png` /
-`settings-reminders.png`（三个设置页）。
+其余截图：`docs/menu.png`（右键菜单）、`docs/settings-profiles.png` / `settings-appearance.png`（两个设置页）、
+`docs/timeframe-dialog.png`（周期齿轮对话框）。
 
 > 截图说明：本机为 125% 缩放 + 远程会话，截图脚本已开启 DPI 感知后再抓取，
 > 否则只能截到被 Windows 虚拟化后的 1536×864 区域，角标会"看起来缺失"。
@@ -291,3 +292,51 @@ python -m unittest discover -s tests -v
 | 内置资源 | 删掉 `%LOCALAPPDATA%\KlineCountdown\icons` 后运行 exe，目录**没有**被重新生成 → 用的是 exe 内置图标 |
 | 实际运行 | 双击后角标正常显示（`--:--` 空闲文案），无控制台窗口，任务栏无多余图标 |
 | 进程 | 两个进程（PyInstaller 引导器 + 应用本体），属 onefile 正常形态 |
+
+---
+
+## 十三、多周期叠加（2026-10-29）
+
+### 需求
+一个品种除了主周期（如 5 分钟），还能叠加更大的周期（30 / 60 分钟）。
+叠加周期平时不显示，只在快收盘时接管角标的颜色/声音；多个周期同时要收盘时，
+只有**周期最大**的那个生效，其余（含主周期）一律静默。角标数字永远是主周期。
+
+### 规则
+| 项 | 结论 |
+| --- | --- |
+| 结构 | `Profile` = 品种级（时段/星期/对齐）+ 多套 `Scheme`；每套 = 1 主周期 + ≤10 叠加周期 |
+| 切主周期 | 整套切换；没配过的方案从默认值起步（不复制现有方案） |
+| 叠加周期 | 严格大于主周期、同方案内不重复、最多 10 个、可删不可提升 |
+| 接管窗口 | 叠加周期剩余 ≤ 主周期长度（= 进入最后一根主周期 K 线） |
+| 仲裁 | 窗口内周期最大者胜；其余周期样式和声音**全部静默**并记为已触发 |
+| 阈值上限 | 所有周期的节点都须严格小于主周期长度 |
+| 数字 | 永远主周期 |
+
+### 改动
+| 文件 | 改动 |
+| --- | --- |
+| `core/models.py` | 新增 `Timeframe` / `Scheme`；`Profile.timeframes → schemes + active_period`；`Appearance` 删掉三个颜色字段；新增 `clamp_thresholds()`；`SCHEMA_VERSION` → 2 |
+| `core/engine.py` | 新增 `BarState`；`CountdownState` 改为 `primary + overlays`；新增 `takeover` / `style_bar` 仲裁；`validate_scheme()` |
+| `core/reminders.py` | 去重键带周期；接管期非接管周期静默；`TickResult` 增加 `style_bar` / `style_rule` |
+| `ui/settings.py` | 周期区改为「主周期下拉 + 叠加周期网格 + 齿轮」；删除提醒 tab；新增 `edit_timeframe_dialog` / `ask_period` / `ReminderEditor`；外观页删掉颜色行 |
+| `ui/badge.py` | `BadgeVisual` 增加 `transparent`（透明背景改为按周期走） |
+| `main.py` | 渲染取 `result.style_bar` 的颜色；切周期改为 `profile.activate()` |
+
+### 验证
+- 自动化 **94 项全绿**（新增 `tests/test_timeframes.py` 17 项：接管窗口边界、静默、多叠加取最大、
+  阈值/重复/数量校验、方案切换、v1→v2 迁移）
+- 时间线实测（5 分钟主周期 + 30 分钟叠加）：
+
+  | 时刻 | 主周期剩余 | 叠加剩余 | 接管 |
+  | --- | --- | --- | --- |
+  | 10:24:59 | 1s | 301s | 无 |
+  | 10:25:00 | 300s | 300s | **30 分钟** |
+  | 10:29:30 | 30s | 30s | 30 分钟 |
+  | 10:30:00 | 300s | 1800s | 无（两根同时结束） |
+
+- 界面实拍：交易时段页（主周期 + 2 个叠加周期网格 + 全局静音）、周期齿轮对话框、外观页（颜色行已移除）
+- 端到端渲染实测：构造 5 分钟主周期 + 10 分钟叠加的临时配置，在接管窗口内截图，
+  角标显示 **主周期的 03:40 + 叠加周期的黄字红底**，证明「数字取主周期、样式取接管周期」生效
+
+---

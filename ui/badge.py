@@ -59,6 +59,7 @@ class BadgeVisual:
     text: str
     fg: str
     bg: str
+    transparent: bool = False
     flash_on: bool = False
     flash_color: str = "#FF0000"
     flash_style: str = "toggle"
@@ -173,13 +174,11 @@ class BadgeWindow:
         return fg, bg
 
     def _redraw(self) -> None:
-        visual = self._visual or BadgeVisual(
-            text="00:00", fg=self.appearance.fg_color, bg=self.appearance.bg_color
-        )
+        visual = self._visual or BadgeVisual(text="00:00", fg="#FFFFFF", bg="#1B1B1F")
         appearance = self.appearance
         fg, bg = self._colors(visual)
         family = self._resolve_family(appearance.font_family)
-        transparent = bool(appearance.transparent_bg)
+        transparent = bool(visual.transparent)
         radius = 0 if transparent else max(0, int(appearance.corner_radius))
 
         key = (

@@ -18,15 +18,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.engine import REASON_BREAK, STATUS_TRADING, compute_state  # noqa: E402
-from core.models import Profile, ReminderRule, TradingSession  # noqa: E402
+from core.models import Profile, ReminderRule, TradingSession, default_scheme  # noqa: E402
 from core.reminders import ReminderScheduler  # noqa: E402
 
 A_STOCK = Profile(
     id="p_ashare",
     name="A 股",
-    period_seconds=300,
     sessions=[TradingSession(570, 690), TradingSession(780, 900)],
     weekdays=[0, 1, 2, 3, 4, 5, 6],
+    schemes=[default_scheme(300)],
+    active_period=300,
 )
 
 WEDNESDAY = datetime(2026, 10, 21)
@@ -79,12 +80,14 @@ class TestAcceptanceATimeline(unittest.TestCase):
             ReminderRule(id="r10", threshold_seconds=10),
             ReminderRule(id="r3", threshold_seconds=3),
         ]
+        scheme = default_scheme(300)
+        scheme.primary.reminders = rules
         profile = Profile(
             id="p",
             name="t",
-            period_seconds=300,
             sessions=[TradingSession(570, 690)],
-            reminders=rules,
+            schemes=[scheme],
+            active_period=300,
         )
         start = WEDNESDAY.replace(hour=9, minute=30, second=0)
         end = WEDNESDAY.replace(hour=10, minute=0, second=0)
@@ -127,7 +130,7 @@ class TestAcceptanceBTimeline(unittest.TestCase):
 class TestAcceptanceCTimeline(unittest.TestCase):
     def test_period_switch_recomputes(self):
         switched = A_STOCK.copy()  # 拷贝，避免污染其他测试的共享对象
-        switched.period_seconds = 900  # 模拟「切换到 15 分钟」
+        switched.activate(900)  # 模拟「切换到 15 分钟」
         state = compute_state(WEDNESDAY.replace(hour=10, minute=7, second=23), switched)
         self.assertEqual(state.remaining_seconds, 457)
         # 偏置：不得从 900 开始倒计时
@@ -135,8 +138,9 @@ class TestAcceptanceCTimeline(unittest.TestCase):
 
     def test_full_15min_boundaries(self):
         profile = Profile(
-            id="p", name="t", period_seconds=900,
+            id="p", name="t",
             sessions=[TradingSession(570, 690), TradingSession(780, 900)],
+            schemes=[default_scheme(900)], active_period=900,
         )
         # 15 分钟边界应与整点/半点对齐：09:30 / 09:45 / 10:00 / 10:15
         cases = [

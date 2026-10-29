@@ -10,18 +10,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.engine import compute_state  # noqa: E402
-from core.models import Profile, ReminderRule, TradingSession  # noqa: E402
+from core.models import Profile, ReminderRule, TradingSession, default_scheme  # noqa: E402
 from core.reminders import ReminderScheduler  # noqa: E402
 
 
 def profile_with_rules(rules) -> Profile:
+    scheme = default_scheme(300)
+    scheme.primary.reminders = list(rules)
     return Profile(
         id="p",
         name="t",
-        period_seconds=300,
         sessions=[TradingSession(9 * 60 + 30, 11 * 60 + 30)],
         weekdays=[0, 1, 2, 3, 4, 5, 6],
-        reminders=rules,
+        schemes=[scheme],
+        active_period=300,
     )
 
 

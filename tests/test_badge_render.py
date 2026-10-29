@@ -40,7 +40,10 @@ def render(
     """按 App 的取色规则（含闪烁）算出颜色，再渲染成 BGRA。"""
     from ui.badge import BadgeWindow
 
-    visual = BadgeVisual(text, fg, bg, flash_on, flash_color, flash_style)
+    visual = BadgeVisual(
+        text=text, fg=fg, bg=bg,
+        flash_on=flash_on, flash_color=flash_color, flash_style=flash_style,
+    )
     real_fg, real_bg = BadgeWindow._colors(None, visual)
     return render_badge(
         text,

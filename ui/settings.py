@@ -1,7 +1,11 @@
-"""设置窗口：交易时段管理 / 外观 / 提醒。
+"""设置窗口：交易时段（含周期方案与提醒）/ 外观。
 
 所有修改通过 ``on_change(cfg)`` 立刻外发，由 App 落盘并应用；
-窗口只是配置的编辑器，不持有业务逻辑。"""
+窗口只是配置的编辑器，不持有业务逻辑。
+
+一个「周期方案」= 主周期 + 若干叠加周期，每个周期自带颜色和提醒节点，
+点周期后面的齿轮进入该周期的设置对话框。
+"""
 
 from __future__ import annotations
 
@@ -15,12 +19,15 @@ from core.models import (
     ALIGNMENT_SESSION,
     FLASH_STYLES,
     FLASH_STYLE_LABELS,
+    MAX_OVERLAYS,
     PERIOD_PRESETS,
     Appearance,
     AppConfig,
     Profile,
     ReminderRule,
+    Timeframe,
     TradingSession,
+    default_reminder_rules,
     format_hm,
     parse_hm,
     sound_source_label,
@@ -36,7 +43,64 @@ from .theme import (
     entry_row,
 )
 
-TABS = ("profiles", "appearance", "reminders")
+TABS = ("profiles", "appearance")
+
+CUSTOM_LABEL = "自定义…"
+
+
+def period_label(seconds: int) -> str:
+    """秒数 -> 下拉框显示文本。"""
+    seconds = int(seconds)
+    for name, preset in PERIOD_PRESETS:
+        if preset == seconds:
+            return name
+    minutes, rest = divmod(seconds, 60)
+    if rest:
+        return f"{minutes} 分 {rest} 秒"
+    return f"{minutes} 分钟"
+
+
+def ask_period(parent, initial: int = 300, minimum: int = 0, title: str = "自定义周期") -> int | None:
+    """弹框输入「几分几秒」，返回秒数；取消返回 None。"""
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+
+    minutes, seconds = divmod(max(0, int(initial)), 60)
+    row = ttk.Frame(dialog)
+    row.pack(padx=16, pady=(16, 8))
+    ttk.Label(row, text="周期").pack(side=tk.LEFT)
+    minute_spin = SpinBox(row, "分", 0, 1440, minutes, None, width=5)
+    minute_spin.pack(side=tk.LEFT, padx=(6, 2))
+    second_spin = SpinBox(row, "秒", 0, 59, seconds, None, width=5)
+    second_spin.pack(side=tk.LEFT, padx=2)
+
+    hint = ttk.Label(dialog, text="", foreground="#C0392B")
+    hint.pack(padx=16)
+
+    result: dict[str, int | None] = {"value": None}
+
+    def commit() -> None:
+        total = minute_spin.value * 60 + second_spin.value
+        if total <= 0:
+            hint.configure(text="周期必须大于 0 秒")
+            return
+        if total <= minimum:
+            hint.configure(text=f"必须大于 {period_label(minimum)}")
+            return
+        result["value"] = total
+        dialog.destroy()
+
+    buttons = ttk.Frame(dialog)
+    buttons.pack(fill=tk.X, padx=16, pady=12)
+    ttk.Button(buttons, text="确定", command=commit).pack(side=tk.RIGHT, padx=4)
+    ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
+    dialog.bind("<Return>", lambda _e: commit())
+    center_on_screen(dialog, 320, 150)
+    parent.wait_window(dialog)
+    return result["value"]
 
 
 def edit_session_dialog(parent, session: TradingSession | None = None) -> TradingSession | None:
@@ -88,12 +152,22 @@ def edit_session_dialog(parent, session: TradingSession | None = None) -> Tradin
 
 
 class ProfilesTab(ttk.Frame):
-    """交易时段配置管理：多配置、多时段、周期、对齐、星期。"""
+    """交易时段配置管理：多配置、多时段、周期方案、对齐、星期、全局静音。"""
 
-    def __init__(self, master, cfg: AppConfig, on_change: Callable[[AppConfig], None], on_active: Callable[[Profile], None]) -> None:
+    def __init__(
+        self,
+        master,
+        cfg: AppConfig,
+        on_change: Callable[[AppConfig], None],
+        on_active: Callable[[Profile], None],
+        on_global_mute: Callable[[bool], None] | None = None,
+        on_preview: Callable[[str, float, int, float], None] | None = None,
+    ) -> None:
         super().__init__(master)
         self.cfg = cfg
         self.on_change = on_change
+        self.on_global_mute = on_global_mute
+        self.on_preview = on_preview or (lambda *_args: None)
         self.on_active = on_active
         self._loading = False
 
@@ -150,27 +224,39 @@ class ProfilesTab(ttk.Frame):
 
         period = ttk.Labelframe(right, text=" K 线周期 ")
         period.pack(fill=tk.X, padx=8, pady=6)
+
+        # 主周期：换它 = 换一整套方案（叠加周期跟着换）
         row = ttk.Frame(period)
-        row.pack(fill=tk.X, padx=8, pady=6)
-        self.period_values = [seconds for _name, seconds in PERIOD_PRESETS]
-        self.period_combo = ttk.Combobox(
-            row,
-            state="readonly",
-            width=12,
-            values=[name for name, _seconds in PERIOD_PRESETS] + ["自定义"],
-        )
-        self.period_combo.pack(side=tk.LEFT, padx=(0, 8))
-        self.period_combo.bind("<<ComboboxSelected>>", self._on_period_select)
-        ttk.Label(row, text="自定义：").pack(side=tk.LEFT)
-        self.custom_min = SpinBox(row, "分", 0, 1440, 0, self._on_period_custom, width=5)
-        self.custom_min.pack(side=tk.LEFT, padx=2)
-        self.custom_sec = SpinBox(row, "秒", 0, 59, 0, self._on_period_custom, width=5)
-        self.custom_sec.pack(side=tk.LEFT, padx=2)
+        row.pack(fill=tk.X, padx=8, pady=(6, 2))
+        ttk.Label(row, text="主周期").pack(side=tk.LEFT)
+        self.primary_combo = ttk.Combobox(row, state="readonly", width=11)
+        self.primary_combo.pack(side=tk.LEFT, padx=(6, 4))
+        self.primary_combo.bind("<<ComboboxSelected>>", self._on_primary_select)
+        self.primary_gear = ttk.Button(row, text="⚙", width=3, command=lambda: self._open_gear(True))
+        self.primary_gear.pack(side=tk.LEFT)
+        ttk.Label(row, text="换主周期 = 换一整套叠加周期", foreground="#888").pack(side=tk.LEFT, padx=10)
+
+        head = ttk.Frame(period)
+        head.pack(fill=tk.X, padx=10, pady=(4, 0))
+        ttk.Label(head, text="叠加周期").pack(side=tk.LEFT)
+        self.overlay_count = ttk.Label(head, text="", foreground="#888")
+        self.overlay_count.pack(side=tk.LEFT, padx=6)
+
+        self.overlay_frame = ttk.Frame(period)
+        self.overlay_frame.pack(fill=tk.X, padx=8, pady=(2, 0))
+        self.overlay_frame.columnconfigure(0, weight=1)
+
+        bottom = ttk.Frame(period)
+        bottom.pack(fill=tk.X, padx=8, pady=(2, 6))
+        self.add_overlay_button = ttk.Button(bottom, text="+ 添加周期", command=self._add_overlay)
+        self.add_overlay_button.pack(side=tk.LEFT)
+        self.overlay_hint = ttk.Label(bottom, text="", foreground="#888")
+        self.overlay_hint.pack(side=tk.LEFT, padx=8)
 
         align = ttk.Frame(period)
         align.pack(fill=tk.X, padx=8, pady=(0, 6))
         ttk.Label(align, text="对齐规则：").pack(side=tk.LEFT)
-        self.align_combo = ttk.Combobox(row := align, state="readonly", width=20, values=list(ALIGNMENT_LABELS.values()))
+        self.align_combo = ttk.Combobox(align, state="readonly", width=20, values=list(ALIGNMENT_LABELS.values()))
         self.align_combo.pack(side=tk.LEFT)
         self.align_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_align())
 
@@ -217,8 +303,26 @@ class ProfilesTab(ttk.Frame):
         ttk.Button(buttons, text="删除", command=self._delete_session).pack(side=tk.LEFT, padx=2)
 
         self.validation = ttk.Label(right, text="", wraplength=320)
-        self.validation.pack(anchor="w", padx=10, pady=(4, 8))
+        self.validation.pack(anchor="w", padx=10, pady=(4, 2))
 
+        # 全局静音：跨所有配置、所有周期生效
+        self._mute_var = tk.BooleanVar(value=bool(cfg.global_mute))
+        ttk.Checkbutton(
+            right,
+            text="一键关闭所有声音与闪烁（全局，跨所有周期）",
+            variable=self._mute_var,
+            command=self._on_mute,
+        ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        self.refresh_list()
+
+    def _on_mute(self) -> None:
+        if self.on_global_mute:
+            self.on_global_mute(bool(self._mute_var.get()))
+
+    def reload(self) -> None:
+        """外部切换了当前配置后，整页重载。"""
+        self._mute_var.set(bool(self.cfg.global_mute))
         self.refresh_list()
 
     # ---- 列表刷新 ----
@@ -246,16 +350,7 @@ class ProfilesTab(ttk.Frame):
             self.listbox.selection_set(index)
             self.name_entry.var.set(profile.name)  # type: ignore[attr-defined]
 
-            preset_seconds = {seconds for _name, seconds in PERIOD_PRESETS}
-            if profile.period_seconds in preset_seconds:
-                label = next(name for name, seconds in PERIOD_PRESETS if seconds == profile.period_seconds)
-                self.period_combo.set(label)
-                minutes, seconds = divmod(profile.period_seconds, 60)
-            else:
-                self.period_combo.set("自定义")
-                minutes, seconds = divmod(profile.period_seconds, 60)
-            self.custom_min.set_value(minutes)
-            self.custom_sec.set_value(seconds)
+            self._refresh_periods()
             self.align_combo.set(ALIGNMENT_LABELS.get(profile.alignment, ALIGNMENT_LABELS[ALIGNMENT_SESSION]))
 
             for day in range(7):
@@ -310,35 +405,176 @@ class ProfilesTab(ttk.Frame):
             index = self.cfg.profiles.index(profile)
             self.listbox.selection_set(index)
 
-    def _on_period_select(self, _event) -> None:  # noqa: ANN001
+    # ---- 周期方案 ----
+
+    def _refresh_periods(self) -> None:
+        """刷新主周期下拉、叠加周期网格和提示。"""
+        profile = self._profile()
+        if not profile:
+            return
+        primary = profile.scheme.primary
+        self.primary_combo.configure(values=[n for n, _s in PERIOD_PRESETS] + [CUSTOM_LABEL])
+        self.primary_combo.set(period_label(primary.period_seconds))
+        self._rebuild_overlays()
+
+    def _rebuild_overlays(self) -> None:
+        for child in self.overlay_frame.winfo_children():
+            child.destroy()
+        profile = self._profile()
+        if not profile:
+            return
+        overlays = profile.overlays
+        primary = profile.primary.period_seconds
+        self.overlay_count.configure(text=f"{len(overlays)}/{MAX_OVERLAYS}")
+
+        for index, timeframe in enumerate(overlays):
+            cell = ttk.Frame(self.overlay_frame)
+            cell.grid(row=index, column=0, sticky="w", pady=2)
+
+            combo = ttk.Combobox(cell, state="readonly", width=10, values=self._overlay_values(primary))
+            combo.set(period_label(timeframe.period_seconds))
+            combo.pack(side=tk.LEFT)
+            combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _e, tf=timeframe, cb=combo: self._on_overlay_select(tf, cb),
+            )
+            ttk.Button(cell, text="⚙", width=3, command=lambda tf=timeframe: self._open_gear(False, tf)).pack(
+                side=tk.LEFT, padx=2
+            )
+            ttk.Button(cell, text="✕", width=3, command=lambda tf=timeframe: self._remove_overlay(tf)).pack(
+                side=tk.LEFT
+            )
+
+        self.add_overlay_button.configure(state="normal" if len(overlays) < MAX_OVERLAYS else "disabled")
+        if len(overlays) >= MAX_OVERLAYS:
+            self.overlay_hint.configure(text=f"已达上限 {MAX_OVERLAYS} 个")
+        else:
+            self.overlay_hint.configure(text="")
+
+    def _overlay_values(self, primary: int) -> list[str]:
+        """叠加周期只能选比主周期大的预设（自定义走对话框再校验）。"""
+        return [name for name, seconds in PERIOD_PRESETS if seconds > primary] + [CUSTOM_LABEL]
+
+    def _on_primary_select(self, _event=None) -> None:  # noqa: ANN001
         if self._loading:
             return
         profile = self._profile()
         if not profile:
             return
-        label = self.period_combo.get()
-        for name, seconds in PERIOD_PRESETS:
-            if name == label:
-                profile.period_seconds = seconds
-                minutes, secs = divmod(seconds, 60)
-                self.custom_min.set_value(minutes)
-                self.custom_sec.set_value(secs)
-                self.on_change(self.cfg)
-                self._show_validation(profile)
+        label = self.primary_combo.get()
+        if label == CUSTOM_LABEL:
+            seconds = ask_period(self, profile.primary.period_seconds, title="自定义主周期")
+            if seconds is None:
+                self._refresh_periods()
+                return
+        else:
+            seconds = next((s for n, s in PERIOD_PRESETS if n == label), None)
+            if seconds is None:
                 return
 
-    def _on_period_custom(self, _value=None) -> None:  # noqa: ANN001
-        if self._loading:
+        if seconds == profile.active_period:
+            self._refresh_periods()
             return
+        # 换主周期 = 换方案；没配置过的方案是一张白纸（默认颜色 + 默认节点 + 无叠加）
+        existed = profile.find_scheme(seconds) is not None
+        profile.activate(seconds)
+        self._refresh_periods()
+        self.on_change(self.cfg)
+        self._show_validation(profile)
+        if not existed:
+            self.overlay_hint.configure(text="新方案：叠加周期需自己添加")
+
+    def _add_overlay(self) -> None:
         profile = self._profile()
         if not profile:
             return
-        total = self.custom_min.value * 60 + self.custom_sec.value
-        if total <= 0:
+        if len(profile.overlays) >= MAX_OVERLAYS:
             return
-        self.period_combo.set("自定义")
-        profile.period_seconds = total
+        primary = profile.primary.period_seconds
+        used = {t.period_seconds for t in profile.overlays}
+        candidates = [s for _n, s in PERIOD_PRESETS if s > primary and s not in used]
+        if candidates:
+            period = min(candidates)
+        else:
+            # 预设都用完了（例如主周期已经 4 小时），直接让用户填
+            period = ask_period(
+                self, max(primary * 2, primary + 60), minimum=primary, title="添加叠加周期"
+            )
+            if period is None:
+                return
+            if period in used:
+                messagebox.showwarning("周期重复", f"{period_label(period)} 已经存在。", parent=self)
+                return
+        profile.scheme.overlays.append(
+            Timeframe(period_seconds=period, reminders=default_reminder_rules(primary))
+        )
+        self._rebuild_overlays()
         self.on_change(self.cfg)
+        self._show_validation(profile)
+
+    def _remove_overlay(self, timeframe: Timeframe) -> None:
+        profile = self._profile()
+        if not profile:
+            return
+        if timeframe.reminders and not messagebox.askyesno(
+            "删除叠加周期",
+            f"{period_label(timeframe.period_seconds)} 有 {len(timeframe.reminders)} 个提醒节点，"
+            "删除后一并丢弃。确定吗？",
+            parent=self,
+        ):
+            return
+        profile.scheme.overlays = [t for t in profile.scheme.overlays if t is not timeframe]
+        self._rebuild_overlays()
+        self.on_change(self.cfg)
+        self._show_validation(profile)
+
+    def _on_overlay_select(self, timeframe: Timeframe, combo: ttk.Combobox) -> None:
+        profile = self._profile()
+        if not profile:
+            return
+        label = combo.get()
+        if label == CUSTOM_LABEL:
+            seconds = ask_period(self, timeframe.period_seconds, minimum=profile.primary.period_seconds,
+                                 title="自定义叠加周期")
+            if seconds is None:
+                self._rebuild_overlays()
+                return
+        else:
+            seconds = next((s for n, s in PERIOD_PRESETS if n == label), None)
+            if seconds is None:
+                return
+
+        primary = profile.primary.period_seconds
+        if seconds <= primary:
+            messagebox.showwarning("周期不合法", f"叠加周期必须大于主周期（{period_label(primary)}）。", parent=self)
+            self._rebuild_overlays()
+            return
+        if any(t is not timeframe and t.period_seconds == seconds for t in profile.overlays):
+            messagebox.showwarning("周期重复", f"{period_label(seconds)} 已经存在。", parent=self)
+            self._rebuild_overlays()
+            return
+
+        timeframe.period_seconds = seconds
+        self._rebuild_overlays()
+        self.on_change(self.cfg)
+        self._show_validation(profile)
+
+    def _open_gear(self, is_primary: bool, timeframe: Timeframe | None = None) -> None:
+        profile = self._profile()
+        if not profile:
+            return
+        target = profile.primary if is_primary else timeframe
+        if target is None:
+            return
+        edit_timeframe_dialog(
+            self,
+            target,
+            is_primary=is_primary,
+            primary_period=profile.primary.period_seconds,
+            on_change=lambda: (self.on_change(self.cfg), self._show_validation(profile), self._rebuild_overlays()),
+            on_preview=self.on_preview,
+        )
+        self._rebuild_overlays()
         self._show_validation(profile)
 
     def _on_align(self) -> None:
@@ -497,29 +733,12 @@ class AppearanceTab(ttk.Frame):
         self.size_scale.pack(side=tk.LEFT)
         ttk.Label(row, text="← 拖动即可实时预览").pack(side=tk.LEFT, padx=6)
 
-        row = ttk.Frame(form)
-        row.pack(fill=tk.X, pady=3)
-        ttk.Label(row, text="颜色", width=12, anchor="w").pack(side=tk.LEFT)
-        ColorButton(row, appearance.fg_color, self._on_fg, label="数字").pack(side=tk.LEFT, padx=(0, 10))
-        self.bg_color_button = ColorButton(row, appearance.bg_color, self._on_bg, label="背景")
-        self.bg_color_button.pack(side=tk.LEFT, padx=(0, 14))
-
-        row = ttk.Frame(form)
-        row.pack(fill=tk.X, pady=3)
-        ttk.Label(row, text="背景", width=12, anchor="w").pack(side=tk.LEFT)
-        self.transparent_var = tk.BooleanVar(value=bool(appearance.transparent_bg))
-        ttk.Checkbutton(
-            row, text="透明背景（只显示数字，不画色块）", variable=self.transparent_var,
-            command=self._on_transparent,
-        ).pack(side=tk.LEFT)
-
         ttk.Label(
             form,
-            text="透明背景时数字边缘是真正的半透明过渡，不需要描边；浅色壁纸上建议把数字换成深色。",
+            text="数字色 / 背景色 / 透明背景已移到每个周期自己的设置里（交易时段页 → 周期后面的 ⚙）。",
             wraplength=640,
             foreground="#666",
-        ).pack(anchor="w", pady=(0, 2))
-        self._sync_transparent_widgets()
+        ).pack(anchor="w", pady=(4, 2))
 
         row = ttk.Frame(form)
         row.pack(fill=tk.X, pady=3)
@@ -611,14 +830,6 @@ class AppearanceTab(ttk.Frame):
         self.appearance.font_size = int(value)
         self._emit()
 
-    def _on_fg(self, color) -> None:
-        self.appearance.fg_color = color
-        self._emit()
-
-    def _on_bg(self, color) -> None:
-        self.appearance.bg_color = color
-        self._emit()
-
     def _on_opacity(self, value) -> None:
         self.appearance.opacity = min(1.0, max(0.1, round(value, 2)))
         self._emit()
@@ -636,19 +847,6 @@ class AppearanceTab(ttk.Frame):
     def _on_radius(self, value) -> None:  # noqa: ANN001
         self.appearance.corner_radius = int(value)
         self._emit()
-
-    def _on_transparent(self) -> None:
-        self.appearance.transparent_bg = bool(self.transparent_var.get())
-        self._sync_transparent_widgets()
-        self._emit()
-
-    def _sync_transparent_widgets(self) -> None:
-        """透明模式下没有底块，背景色用不上，置灰避免误导。"""
-        transparent = bool(self.appearance.transparent_bg)
-        try:
-            self.bg_color_button.set_enabled(not transparent)
-        except AttributeError:
-            pass
 
     def _on_idle_text(self, text) -> None:
         self.appearance.idle_text = text
@@ -700,58 +898,57 @@ class AppearanceTab(ttk.Frame):
             self.height_spin.set_value(self.appearance.height)
             self.radius_spin.set_value(self.appearance.corner_radius)
             self.weight_combo.set(self.appearance.font_weight)
-            self.transparent_var.set(bool(self.appearance.transparent_bg))
-            self._sync_transparent_widgets()
             for field, var in getattr(self, "_flag_vars", {}).items():
                 var.set(bool(getattr(self.appearance, field, False)))
         finally:
             self._loading = False
 
 
-class ReminderTab(ttk.Frame):
-    """提醒规则：多个节点、颜色/闪烁/声音，全局静音，周期结束提示音。"""
+class ReminderEditor(ttk.Frame):
+    """编辑某个周期的提醒节点：表格 + 增删改 + 试听。
+
+    数据直接改 ``timeframe.reminders``，每次改动都回调 ``on_change()``，
+    由上层负责落盘并让角标立即重绘。
+    """
 
     def __init__(
         self,
         master,
-        profile: Profile,
-        global_mute: bool,
-        on_change: Callable[[Profile], None],
-        on_global_mute: Callable[[bool], None],
+        timeframe: Timeframe,
+        primary_period: int,
+        on_change: Callable[[], None],
         on_preview: Callable[[str, float, int, float], None],
     ) -> None:
         super().__init__(master)
-        self.profile = profile
+        self.timeframe = timeframe
+        self.primary_period = primary_period
         self.on_change = on_change
-        self.on_global_mute = on_global_mute
         self.on_preview = on_preview
+        self._build()
 
-        ttk.Label(self, text="提醒节点（每根 K 线各自触发一次）", font=(None, 11, "bold")).pack(anchor="w", padx=8, pady=(8, 4))
+    @property
+    def limit(self) -> int:
+        """阈值上限：必须严格小于主周期长度。"""
+        return max(1, int(self.primary_period) - 1)
 
-        self._mute_box = check_row(self, "一键关闭所有声音与闪烁提醒", global_mute, self._on_mute)
-        self._mute_box.pack(anchor="w", padx=12, pady=(0, 4))
-        ttk.Label(
-            self,
-            text="规则按剩余秒数由宽到严触发；同一根 K 线的同一节点只响一次，进入下一根 K 线后重置。",
-            wraplength=520,
-            foreground="#666",
-        ).pack(anchor="w", padx=12)
+    # ---- 构建 ----
 
+    def _build(self) -> None:
         columns = ("enabled", "seconds", "title", "flash", "sound")
-        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=8)
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=6)
         self.tree.heading("enabled", text="启用")
         self.tree.heading("seconds", text="剩余(秒)")
         self.tree.heading("title", text="样式预览")
         self.tree.heading("flash", text="闪烁")
         self.tree.heading("sound", text="声音")
-        widths = {"enabled": 60, "seconds": 80, "title": 210, "flash": 150, "sound": 60}
-        for col in columns:
-            self.tree.column(col, width=widths[col], anchor="center")
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        widths = {"enabled": 55, "seconds": 80, "title": 240, "flash": 160, "sound": 55}
+        for column in columns:
+            self.tree.column(column, width=widths[column], anchor="center")
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 4))
         self.tree.bind("<Double-Button-1>", lambda _e: self._edit_rule())
 
         buttons = ttk.Frame(self)
-        buttons.pack(fill=tk.X, padx=12, pady=(0, 8))
+        buttons.pack(fill=tk.X, padx=10, pady=(0, 4))
         ttk.Button(buttons, text="添加节点", command=self._add_rule).pack(side=tk.LEFT, padx=2)
         ttk.Button(buttons, text="编辑", command=self._edit_rule).pack(side=tk.LEFT, padx=2)
         ttk.Button(buttons, text="删除", command=self._delete_rule).pack(side=tk.LEFT, padx=2)
@@ -760,7 +957,7 @@ class ReminderTab(ttk.Frame):
         ttk.Button(buttons, text="全部试听", command=self._preview_all).pack(side=tk.RIGHT, padx=2)
 
         self.status = ttk.Label(self, text="", foreground="#C0392B")
-        self.status.pack(anchor="w", padx=12, pady=(0, 8))
+        self.status.pack(anchor="w", padx=12, pady=(0, 6))
 
         self._refresh_table()
 
@@ -768,14 +965,18 @@ class ReminderTab(ttk.Frame):
 
     def _refresh_table(self) -> None:
         self.tree.delete(*self.tree.get_children())
-        for rule in sorted(self.profile.reminders, key=lambda r: r.threshold_seconds, reverse=True):
+        for rule in sorted(self.timeframe.reminders, key=lambda r: r.threshold_seconds, reverse=True):
             preview = f"{rule.threshold_seconds}s  12:34  ▮{rule.fg_color}▮{rule.bg_color}"
-            flash = f"{rule.flash_hz:g}Hz {FLASH_STYLE_LABELS.get(rule.flash_style, rule.flash_style)}" if rule.flash else "否"
+            flash = (
+                f"{rule.flash_hz:g}Hz {FLASH_STYLE_LABELS.get(rule.flash_style, rule.flash_style)}"
+                if rule.flash
+                else "否"
+            )
             self.tree.insert(
                 "", tk.END,
                 iid=rule.id,
                 values=("是" if rule.enabled else "否", rule.threshold_seconds, preview, flash,
-                       "是" if rule.sound else "否"),
+                        "是" if rule.sound else "否"),
             )
 
     # ---- 规则编辑 ----
@@ -785,66 +986,136 @@ class ReminderTab(ttk.Frame):
         if not selection:
             return None
         rule_id = selection[0]
-        for rule in self.profile.reminders:
+        for rule in self.timeframe.reminders:
             if rule.id == rule_id:
                 return rule
         return None
 
     def _add_rule(self) -> None:
-        rule = ReminderRule()
-        self.profile.reminders.append(rule)
-        self.on_change(self.profile)
+        rule = ReminderRule(threshold_seconds=min(60, self.limit))
+        if rule.threshold_seconds >= self.primary_period:
+            rule.threshold_seconds = self.limit
+        self.timeframe.reminders.append(rule)
+        self.on_change()
         self._refresh_table()
         self.tree.selection_set(rule.id)
 
     def _edit_rule(self) -> None:
         rule = self._selected_rule()
-        if rule:
-            edit_reminder_dialog(self, rule, self.profile, self.on_change, self.on_preview)
-            self._refresh_table()
+        if not rule:
+            return
+        edit_reminder_dialog(self, rule, self.primary_period, self.on_change, self.on_preview)
+        self._refresh_table()
 
     def _delete_rule(self) -> None:
         rule = self._selected_rule()
         if not rule:
             return
-        self.profile.reminders = [r for r in self.profile.reminders if r.id != rule.id]
-        self.on_change(self.profile)
+        self.timeframe.reminders = [r for r in self.timeframe.reminders if r.id != rule.id]
+        self.on_change()
         self._refresh_table()
 
     def _move_rule(self, delta: int) -> None:
         rule = self._selected_rule()
         if not rule:
             return
-        rules = self.profile.reminders
+        rules = self.timeframe.reminders
         index = next(i for i, r in enumerate(rules) if r.id == rule.id)
         target = index + delta
         if not (0 <= target < len(rules)):
             return
         rules[index], rules[target] = rules[target], rules[index]
-        self.on_change(self.profile)
+        self.on_change()
         self._refresh_table()
 
     def _preview_all(self) -> None:
-        for rule in self.profile.reminders:
+        for rule in self.timeframe.reminders:
             if rule.enabled and rule.sound:
                 self.on_preview(rule.sound_source, rule.volume, rule.sound_repeat, rule.sound_interval)
                 return
         self.status.configure(text="没有启用声音的提醒节点。")
 
-    # ---- 一键静音 ----
 
-    def _on_mute(self) -> None:
-        self.on_global_mute(bool(self._mute_box.var.get()))  # type: ignore[attr-defined]
+def edit_timeframe_dialog(
+    parent,
+    timeframe: Timeframe,
+    *,
+    is_primary: bool,
+    primary_period: int,
+    on_change: Callable[[], None],
+    on_preview: Callable[[str, float, int, float], None],
+) -> None:
+    """一个周期的设置：颜色 + 提醒节点。"""
+    dialog = tk.Toplevel(parent)
+    role = "主周期" if is_primary else "叠加周期"
+    dialog.title(f"{period_label(timeframe.period_seconds)} · {role}")
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(True, True)
 
+    style = ttk.Labelframe(dialog, text=" 显示样式 " if is_primary else " 接管样式 ")
+    style.pack(fill=tk.X, padx=14, pady=(14, 6))
+
+    if not is_primary:
+        ttk.Label(
+            style,
+            text=f"每根 {period_label(primary_period)} K 线的最后 {period_label(primary_period)}，"
+                 "角标换成这套颜色；期间主周期和更低周期的提醒不显示。",
+            wraplength=620,
+            foreground="#888",
+        ).pack(anchor="w", padx=10, pady=(6, 0))
+
+    row = ttk.Frame(style)
+    row.pack(fill=tk.X, padx=10, pady=8)
+
+    def apply_color(field: str, color: str) -> None:
+        setattr(timeframe, field, color)
+        on_change()
+
+    ColorButton(row, timeframe.fg_color, lambda c: apply_color("fg_color", c), label="数字色").pack(
+        side=tk.LEFT, padx=(0, 14)
+    )
+    ColorButton(row, timeframe.bg_color, lambda c: apply_color("bg_color", c), label="背景色").pack(
+        side=tk.LEFT, padx=(0, 14)
+    )
+
+    transparent_var = tk.BooleanVar(value=bool(timeframe.transparent_bg))
+
+    def toggle_transparent() -> None:
+        timeframe.transparent_bg = bool(transparent_var.get())
+        on_change()
+
+    ttk.Checkbutton(row, text="透明背景（只显示数字）", variable=transparent_var,
+                    command=toggle_transparent).pack(side=tk.LEFT)
+
+    rules = ttk.Labelframe(dialog, text=" 提醒节点 ")
+    rules.pack(fill=tk.BOTH, expand=True, padx=14, pady=6)
+    ttk.Label(
+        rules,
+        text=f"剩余秒数须小于主周期（最大 {max(1, primary_period - 1)} 秒）；"
+             "同一根 K 线的同一节点只触发一次。",
+        foreground="#888",
+    ).pack(anchor="w", padx=10, pady=(6, 0))
+
+    ReminderEditor(rules, timeframe, primary_period, on_change, on_preview).pack(fill=tk.BOTH, expand=True)
+
+    footer = ttk.Frame(dialog)
+    footer.pack(fill=tk.X, padx=14, pady=(0, 12))
+    ttk.Button(footer, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
+
+    dialog.bind("<Escape>", lambda _e: dialog.destroy())
+    center_on_screen(dialog, 720, 620)
+    parent.wait_window(dialog)
 
 def edit_reminder_dialog(
     parent,
     rule: ReminderRule,
-    profile: Profile,
-    on_change: Callable[[Profile], None],
+    primary_period: int,
+    on_change: Callable[[], None],
     on_preview: Callable[[str, float, int, float], None],
 ) -> None:
-    """编辑单个提醒节点。"""
+    """编辑单个提醒节点。阈值上限 = 主周期长度 - 1（严格小于主周期）。"""
+    limit = max(1, int(primary_period) - 1)
     dialog = tk.Toplevel(parent)
     dialog.title(f"提醒节点：剩余 {rule.threshold_seconds} 秒")
     dialog.transient(parent)
@@ -857,9 +1128,9 @@ def edit_reminder_dialog(
     row = ttk.Frame(dialog)
     row.pack(fill=tk.X, padx=16, pady=4)
     ttk.Label(row, text="剩余时间 ≥").pack(side=tk.LEFT)
-    seconds = SpinBox(row, "", 0, 86400, rule.threshold_seconds, None)
+    seconds = SpinBox(row, "", 1, limit, min(int(rule.threshold_seconds), limit), None)
     seconds.pack(side=tk.LEFT, padx=4)
-    ttk.Label(row, text="秒（进入该节点时触发）").pack(side=tk.LEFT)
+    ttk.Label(row, text=f"秒（须小于主周期，最大 {limit}）").pack(side=tk.LEFT)
 
     colors = ttk.Labelframe(dialog, text=" 样式 ")
     colors.pack(fill=tk.X, padx=16, pady=6)
@@ -934,7 +1205,7 @@ def edit_reminder_dialog(
 
     def commit() -> None:
         rule.enabled = enabled.var.get()  # type: ignore[attr-defined]
-        rule.threshold_seconds = max(0, seconds.value)
+        rule.threshold_seconds = min(limit, max(1, seconds.value))
         rule.flash = flash.var.get()  # type: ignore[attr-defined]
         selected = {FLASH_STYLE_LABELS[key]: key for key in FLASH_STYLES}.get(style.get(), rule.flash_style)
         rule.flash_style = selected
@@ -947,7 +1218,7 @@ def edit_reminder_dialog(
         rule.volume = volume.value
         rule.sound_repeat = max(1, repeat.value)
         rule.sound_interval = interval.value
-        on_change(profile)
+        on_change()
         dialog.destroy()
 
     ttk.Button(buttons, text="保存", command=commit).pack(side=tk.RIGHT, padx=4)
@@ -990,43 +1261,25 @@ class SettingsWindow:
         notebook = ttk.Notebook(self.window)
         notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.profiles_tab = ProfilesTab(notebook, cfg, self._commit, on_active_profile)
+        self.profiles_tab = ProfilesTab(
+            notebook, cfg, self._commit, on_active_profile, self._commit_global_mute, on_preview
+        )
         self.profiles_tab.pack(fill=tk.BOTH, expand=True)
         notebook.add(self.profiles_tab, text=" 交易时段 ")
 
         self.appearance_tab = AppearanceTab(notebook, cfg.appearance, self._commit_appearance)
         notebook.add(self.appearance_tab, text=" 外观 ")
 
-        self.reminder_tab = ReminderTab(
-            notebook, cfg.active_profile(), cfg.global_mute, self._commit_profile, self._commit_global_mute, on_preview
-        )
-        notebook.add(self.reminder_tab, text=" 提醒 ")
         self.on_preview = on_preview
 
         wanted = TABS.index(tab) if tab in TABS else 0
         notebook.select(wanted)
-        center_on_screen(self.window, 920, 790)
+        center_on_screen(self.window, 960, 860)
         self.notebook = notebook
 
     def on_active_profile_changed(self, profile: Profile) -> None:
-        """切换当前配置后，提醒页改为编辑新配置（互不覆盖）。"""
-        try:
-            self.reminder_tab.destroy()
-        except Exception:  # noqa: BLE001
-            pass
-        self.reminder_tab = ReminderTab(
-            self.notebook,
-            profile,
-            self.cfg.global_mute,
-            self._commit_profile,
-            self._commit_global_mute,
-            self.on_preview,
-        )
-        try:
-            self.notebook.forget(self.reminder_tab)
-        except tk.TclError:
-            pass
-        self.notebook.add(self.reminder_tab, text=" 提醒 ")
+        """切换当前配置后，交易时段页整页重载（周期方案跟着换）。"""
+        self.profiles_tab.reload()
 
     def _commit(self, cfg: AppConfig) -> None:
         self.on_change(cfg)

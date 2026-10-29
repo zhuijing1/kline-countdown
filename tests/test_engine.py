@@ -26,6 +26,7 @@ from core.models import (  # noqa: E402
     ALIGNMENT_SESSION,
     Profile,
     TradingSession,
+    default_scheme,
 )
 
 WED = datetime(2026, 10, 21)  # 星期三
@@ -36,10 +37,11 @@ def ashare(period=300, alignment=ALIGNMENT_SESSION, weekdays=(0, 1, 2, 3, 4)) ->
     return Profile(
         id="p_ashare",
         name="A 股",
-        period_seconds=period,
         alignment=alignment,
         sessions=[TradingSession(9 * 60 + 30, 11 * 60 + 30), TradingSession(13 * 60, 15 * 60)],
         weekdays=list(weekdays),
+        schemes=[default_scheme(period)],
+        active_period=period,
     )
 
 
@@ -47,10 +49,11 @@ def custom(sessions, period=300, alignment=ALIGNMENT_SESSION, weekdays=(0, 1, 2,
     return Profile(
         id="p_custom",
         name="自定义",
-        period_seconds=period,
         alignment=alignment,
         sessions=[TradingSession(start, end, enabled=True) for start, end in sessions],
         weekdays=list(weekdays),
+        schemes=[default_scheme(period)],
+        active_period=period,
     )
 
 
@@ -183,8 +186,9 @@ class TestWeekdayAndBreakRules(unittest.TestCase):
         profile = Profile(
             id="p1",
             name="x",
-            period_seconds=300,
             sessions=[TradingSession(570, 690), TradingSession(780, 900, enabled=False)],
+            schemes=[default_scheme(300)],
+            active_period=300,
         )
         state = compute_state(WED.replace(hour=14, minute=0), profile)
         self.assertEqual(state.reason, REASON_AFTER_CLOSE)
@@ -203,7 +207,11 @@ class TestValidation(unittest.TestCase):
         self.assertTrue(any("开始时间" in e for e in errors))
 
     def test_no_enabled_session(self):
-        profile = Profile(id="p", name="x", period_seconds=60, sessions=[TradingSession(570, 690, enabled=False)])
+        profile = Profile(
+            id="p", name="x",
+            sessions=[TradingSession(570, 690, enabled=False)],
+            schemes=[default_scheme(60)], active_period=60,
+        )
         self.assertTrue(validate_profile(profile))
         self.assertEqual(compute_state(WED.replace(hour=10), profile).status, STATUS_ERROR)
 

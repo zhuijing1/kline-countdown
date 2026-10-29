@@ -16,7 +16,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -28,6 +28,9 @@ PERIOD_PRESETS = (
     ("15 分钟", 900),
     ("30 分钟", 1800),
     ("60 分钟", 3600),
+    ("2 小时", 7200),
+    ("3 小时", 10800),
+    ("4 小时", 14400),
 )
 
 ALIGNMENT_SESSION = "session"
@@ -55,6 +58,9 @@ FILE_PREFIX = "file:"
 
 MAX_PERIOD_SECONDS = 24 * 3600
 MIN_PERIOD_SECONDS = 5
+
+#: 每套方案里最多叠加多少个周期
+MAX_OVERLAYS = 10
 
 
 def new_id(prefix: str) -> str:
@@ -181,16 +187,25 @@ class ReminderRule:
         )
 
 
-def default_reminder_rules() -> list[ReminderRule]:
-    """默认提醒节点：60/30/10/3 秒。"""
-    rules: list[ReminderRule] = []
+def default_reminder_rules(period_seconds: int = 300) -> list[ReminderRule]:
+    """默认提醒节点：60/30/10/3 秒。
+
+    提醒阈值必须严格小于主周期长度，所以周期很短（1 分钟及以下）时会自动裁掉
+    超限的节点；连一个都不剩就给一个「最后一秒」节点，保证角标不是哑巴。
+    """
+    limit = max(2, int(period_seconds))
     presets = [
         (60, "#FFFFFF", "#B3261E", True, 2.0, PRESET_PREFIX + "ding", 1),
         (30, "#FFFFFF", "#C2410C", True, 2.5, PRESET_PREFIX + "beep", 1),
         (10, "#FFFFFF", "#B91C1C", True, 4.0, PRESET_PREFIX + "tick", 1),
         (3, "#111111", "#FDE047", True, 6.0, PRESET_PREFIX + "tick", 1),
     ]
-    for threshold, fg, bg, flash, hz, src, repeat in presets:
+    usable = [p for p in presets if p[0] < limit]
+    if not usable:
+        usable = [(max(1, limit - 1), "#FFFFFF", "#B3261E", True, 2.0, PRESET_PREFIX + "ding", 1)]
+
+    rules: list[ReminderRule] = []
+    for threshold, fg, bg, flash, hz, src, repeat in usable:
         rules.append(
             ReminderRule(
                 threshold_seconds=threshold,
@@ -205,57 +220,223 @@ def default_reminder_rules() -> list[ReminderRule]:
     return rules
 
 
-@dataclass
-class Profile:
-    """一套完整的交易时段配置：时段 + 周期 + 对齐规则 + 提醒。"""
+def clamp_thresholds(scheme: "Scheme") -> int:
+    """把超过主周期长度的阈值压到「主周期-1」，返回被改动的条数。
 
-    id: str = field(default_factory=lambda: new_id("profile"))
-    name: str = "新配置"
+    用于配置迁移：v1 的节点是按当时的主周期配的，升级后主周期可能变小，
+    不压一下会直接变成「配置错误」把角标打成 ERR。
+    """
+    limit = max(1, int(scheme.primary.period_seconds))
+    changed = 0
+    for timeframe in (scheme.primary, *scheme.overlays):
+        for rule in timeframe.reminders:
+            if rule.threshold_seconds >= limit:
+                rule.threshold_seconds = limit - 1
+                changed += 1
+    return changed
+
+
+@dataclass
+class Timeframe:
+    """一个周期的完整配置：周期值 + 自己的颜色 + 自己的提醒节点。
+
+    主周期用 ``fg_color/bg_color`` 作为平时显示的颜色；
+    叠加周期用同一组字段作为「接管样式」——进入接管窗口后角标换成这套颜色。
+    """
+
     period_seconds: int = 300
-    alignment: str = ALIGNMENT_SESSION
-    sessions: list[TradingSession] = field(default_factory=list)
-    weekdays: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
+    fg_color: str = "#FFFFFF"
+    bg_color: str = "#1B1B1F"
+    transparent_bg: bool = False  # 只对主周期有意义；叠加周期接管时一般都画底色
     reminders: list[ReminderRule] = field(default_factory=default_reminder_rules)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id,
-            "name": self.name,
             "period_seconds": self.period_seconds,
-            "alignment": self.alignment,
-            "sessions": [s.to_dict() for s in self.sessions],
-            "weekdays": list(self.weekdays),
+            "fg_color": self.fg_color,
+            "bg_color": self.bg_color,
+            "transparent_bg": self.transparent_bg,
             "reminders": [r.to_dict() for r in self.reminders],
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Profile":
+    def from_dict(cls, data: dict[str, Any]) -> "Timeframe":
         data = data or {}
-        sessions = [TradingSession.from_dict(s) for s in data.get("sessions") or []]
-        if not sessions:
-            sessions = [TradingSession(570, 690), TradingSession(780, 900)]
+        default = cls()
         reminders_raw = data.get("reminders")
         reminders = (
             [ReminderRule.from_dict(r) for r in reminders_raw]
             if isinstance(reminders_raw, list)
             else default_reminder_rules()
         )
-        weekdays = [int(d) for d in data.get("weekdays", [0, 1, 2, 3, 4]) if 0 <= int(d) <= 6]
         return cls(
+            period_seconds=int(data.get("period_seconds", default.period_seconds)),
+            fg_color=str(data.get("fg_color", default.fg_color)),
+            bg_color=str(data.get("bg_color", default.bg_color)),
+            transparent_bg=bool(data.get("transparent_bg", default.transparent_bg)),
+            reminders=reminders,
+        )
+
+    @property
+    def max_threshold(self) -> int:
+        """本周期所有启用节点里最大的提前量（秒）。"""
+        values = [int(r.threshold_seconds) for r in self.reminders if r.enabled]
+        return max(values) if values else 0
+
+
+@dataclass
+class Scheme:
+    """一套「周期方案」：一个主周期 + 若干叠加周期。
+
+    切换主周期 = 切换到另一套 Scheme，叠加周期和各周期的设置整套跟着换。
+    """
+
+    primary: Timeframe = field(default_factory=Timeframe)
+    overlays: list[Timeframe] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "primary": self.primary.to_dict(),
+            "overlays": [o.to_dict() for o in self.overlays],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Scheme":
+        data = data or {}
+        return cls(
+            primary=Timeframe.from_dict(data.get("primary") or {}),
+            overlays=[Timeframe.from_dict(o) for o in data.get("overlays") or []],
+        )
+
+    @property
+    def period_seconds(self) -> int:
+        return int(self.primary.period_seconds)
+
+    def sorted_overlays(self) -> list[Timeframe]:
+        return sorted(self.overlays, key=lambda t: t.period_seconds)
+
+
+def default_scheme(period_seconds: int = 300) -> Scheme:
+    """新建方案：主周期用默认样式 + 与周期匹配的默认节点，没有叠加周期。"""
+    period = int(period_seconds)
+    return Scheme(primary=Timeframe(period_seconds=period, reminders=default_reminder_rules(period)))
+
+
+@dataclass
+class Profile:
+    """一套交易时段配置：品种级（时段/星期/对齐）+ 多套周期方案。"""
+
+    id: str = field(default_factory=lambda: new_id("profile"))
+    name: str = "新配置"
+    alignment: str = ALIGNMENT_SESSION
+    sessions: list[TradingSession] = field(default_factory=list)
+    weekdays: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
+    schemes: list[Scheme] = field(default_factory=lambda: [default_scheme()])
+    active_period: int = 300  # 当前方案的主周期秒数
+
+    # ---- 方案访问 ----
+
+    def find_scheme(self, period_seconds: int) -> Scheme | None:
+        for scheme in self.schemes:
+            if scheme.period_seconds == int(period_seconds):
+                return scheme
+        return None
+
+    def activate(self, period_seconds: int) -> Scheme:
+        """切到某个主周期；没有就新建一套默认方案（不复制现有方案）。"""
+        period = int(period_seconds)
+        scheme = self.find_scheme(period)
+        if scheme is None:
+            scheme = default_scheme(period)
+            self.schemes.append(scheme)
+        self.active_period = period
+        return scheme
+
+    @property
+    def scheme(self) -> Scheme:
+        scheme = self.find_scheme(self.active_period)
+        if scheme is None:
+            scheme = self.activate(self.active_period)
+        return scheme
+
+    @property
+    def primary(self) -> Timeframe:
+        return self.scheme.primary
+
+    @property
+    def period_seconds(self) -> int:
+        """当前主周期的秒数（只读；要换周期请用 :meth:`activate`）。"""
+        return int(self.active_period)
+
+    @property
+    def overlays(self) -> list[Timeframe]:
+        return self.scheme.sorted_overlays()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "alignment": self.alignment,
+            "sessions": [s.to_dict() for s in self.sessions],
+            "weekdays": list(self.weekdays),
+            "active_period": self.active_period,
+            "schemes": [s.to_dict() for s in self.schemes],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], *, legacy_style: dict[str, Any] | None = None) -> "Profile":
+        data = data or {}
+        sessions = [TradingSession.from_dict(s) for s in data.get("sessions") or []]
+        if not sessions:
+            sessions = [TradingSession(570, 690), TradingSession(780, 900)]
+        weekdays = [int(d) for d in data.get("weekdays", [0, 1, 2, 3, 4]) if 0 <= int(d) <= 6]
+
+        schemes_raw = data.get("schemes")
+        if isinstance(schemes_raw, list) and schemes_raw:
+            schemes = [Scheme.from_dict(s) for s in schemes_raw]
+            active = int(data.get("active_period", schemes[0].period_seconds))
+        else:
+            # v1 迁移：单个 period_seconds + reminders（颜色当时存在全局 appearance 里）
+            period = int(data.get("period_seconds", 300))
+            reminders_raw = data.get("reminders")
+            reminders = (
+                [ReminderRule.from_dict(r) for r in reminders_raw]
+                if isinstance(reminders_raw, list)
+                else default_reminder_rules()
+            )
+            style = dict(legacy_style or {})
+            primary = Timeframe(period_seconds=period, reminders=reminders, **{
+                k: v for k, v in style.items()
+                if k in ("fg_color", "bg_color", "transparent_bg")
+            })
+            schemes = [Scheme(primary=primary)]
+            active = period
+
+        profile = cls(
             id=str(data.get("id") or new_id("profile")),
             name=str(data.get("name") or "未命名配置"),
-            period_seconds=int(data.get("period_seconds", 300)),
             alignment=str(data.get("alignment", ALIGNMENT_SESSION)),
             sessions=sessions,
             weekdays=weekdays,
-            reminders=reminders,
+            schemes=schemes,
+            active_period=active,
         )
+        if profile.find_scheme(active) is None:
+            profile.active_period = profile.schemes[0].period_seconds
+        for scheme in profile.schemes:
+            clamp_thresholds(scheme)
+        return profile
 
     def copy(self, *, rename: str | None = None, new_id_flag: bool = True) -> "Profile":
         clone = Profile.from_dict(self.to_dict())
         if new_id_flag:
             clone.id = new_id("profile")
-            clone.reminders = [ReminderRule.from_dict({**r.to_dict(), "id": new_id("rem")}) for r in self.reminders]
+            for scheme in clone.schemes:
+                for timeframe in [scheme.primary, *scheme.overlays]:
+                    timeframe.reminders = [
+                        ReminderRule.from_dict({**r.to_dict(), "id": new_id("rem")})
+                        for r in timeframe.reminders
+                    ]
         if rename is not None:
             clone.name = rename
         return clone
@@ -263,21 +444,21 @@ class Profile:
 
 @dataclass
 class Appearance:
-    """角标外观。修改后立即生效并持久化。"""
+    """角标的物理外观（跨品种、跨周期共享）。
+
+    颜色不在这里——每个周期各有自己的颜色，见 :class:`Timeframe`。
+    """
 
     font_family: str = "Bahnschrift"  # 笔画干净、数字辨识度高；缺失时自动回退
     font_size: int = 32
     font_weight: str = "normal"
-    fg_color: str = "#FFFFFF"
-    bg_color: str = "#1B1B1F"
-    transparent_bg: bool = False  # True = 不画底色，只留数字（逐像素 alpha，无需描边）
     opacity: float = 0.90
     padding_x: int = 16
     padding_y: int = 4
     width: int = 0  # 0 = 按字体自动
     height: int = 0
     corner_radius: int = 10  # 0 = 直角（更锐利，无边缘杂色）
-    idle_text: str = "--:--"  # 非交易时段只换文案，颜色沿用上面的数字/背景色
+    idle_text: str = "--:--"  # 非交易时段只换文案，颜色沿用主周期的颜色
     always_on_top: bool = True
     click_through: bool = False
     locked: bool = False
@@ -337,12 +518,20 @@ class AppConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
         data = data or {}
-        profiles = [Profile.from_dict(p) for p in data.get("profiles") or []]
+        raw_appearance = data.get("appearance") or {}
+        # v1 的颜色存在全局 appearance 里；迁移时塞给各配置的主周期
+        legacy_style = {
+            "fg_color": raw_appearance.get("fg_color"),
+            "bg_color": raw_appearance.get("bg_color"),
+            "transparent_bg": raw_appearance.get("transparent_bg"),
+        }
+        legacy_style = {k: v for k, v in legacy_style.items() if v is not None}
+        profiles = [Profile.from_dict(p, legacy_style=legacy_style) for p in data.get("profiles") or []]
         cfg = cls(
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
             active_profile_id=str(data.get("active_profile_id") or ""),
             profiles=profiles,
-            appearance=Appearance.from_dict(data.get("appearance") or {}),
+            appearance=Appearance.from_dict(raw_appearance),
             global_mute=bool(data.get("global_mute", False)),
             autostart=bool(data.get("autostart", False)),
             hidden=bool(data.get("hidden", False)),
@@ -371,15 +560,14 @@ def default_profiles() -> list[Profile]:
     """首次启动的三套内置配置。用户可自由修改/删除。"""
     ashare = Profile(
         name="A 股",
-        period_seconds=300,
         alignment=ALIGNMENT_SESSION,
         sessions=[TradingSession(570, 690), TradingSession(780, 900)],
         weekdays=[0, 1, 2, 3, 4],
-        reminders=default_reminder_rules(),
+        schemes=[default_scheme(300)],
+        active_period=300,
     )
     futures = Profile(
         name="期货（日盘+夜盘）",
-        period_seconds=300,
         alignment=ALIGNMENT_SESSION,
         sessions=[
             TradingSession(540, 615),   # 09:00–10:15
@@ -388,14 +576,15 @@ def default_profiles() -> list[Profile]:
             TradingSession(1260, 1380), # 21:00–23:00
         ],
         weekdays=[0, 1, 2, 3, 4],
-        reminders=default_reminder_rules(),
+        schemes=[default_scheme(300)],
+        active_period=300,
     )
     all_day = Profile(
         name="全天连续（整点对齐）",
-        period_seconds=900,
         alignment=ALIGNMENT_CLOCK,
         sessions=[TradingSession(0, 1440)],
         weekdays=[0, 1, 2, 3, 4, 5, 6],
-        reminders=default_reminder_rules(),
+        schemes=[default_scheme(900)],
+        active_period=900,
     )
     return [ashare, futures, all_day]

@@ -46,7 +46,7 @@ class TestPersistence(TempConfigTestCase):
         store = self.store()
         cfg = store.load()
         cfg.profiles[0].name = "我的A股"
-        cfg.profiles[0].period_seconds = 180
+        cfg.profiles[0].activate(180)
         cfg.appearance.font_size = 42
         cfg.global_mute = True
         store.save(cfg)
@@ -63,16 +63,16 @@ class TestPersistence(TempConfigTestCase):
         store = self.store()
         cfg = store.load()
         ashare = cfg.profiles[0]
-        ashare.reminders = [ReminderRule(id="r_ashare", threshold_seconds=42)]
+        ashare.primary.reminders = [ReminderRule(id="r_ashare", threshold_seconds=42)]
         futures = cfg.profiles[1]
-        futures.reminders = [ReminderRule(id="r_fut", threshold_seconds=17)]
-        futures.period_seconds = 600
+        futures.activate(600)  # 先切周期，再改这一套的节点
+        futures.primary.reminders = [ReminderRule(id="r_fut", threshold_seconds=17)]
         store.save(cfg)
 
         reloaded = self.store().load()
         by_id = {p.id: p for p in reloaded.profiles}
-        self.assertEqual(by_id[ashare.id].reminders[0].threshold_seconds, 42)
-        self.assertEqual(by_id[futures.id].reminders[0].threshold_seconds, 17)
+        self.assertEqual(by_id[ashare.id].primary.reminders[0].threshold_seconds, 42)
+        self.assertEqual(by_id[futures.id].primary.reminders[0].threshold_seconds, 17)
         self.assertEqual(by_id[futures.id].period_seconds, 600)
         self.assertEqual(by_id[ashare.id].period_seconds, 300)
 
@@ -102,8 +102,8 @@ class TestPersistence(TempConfigTestCase):
         clone = default_profiles()[0].copy(rename="副本")
         self.assertNotEqual(clone.id, default_profiles()[0].id)
         self.assertEqual(clone.name, "副本")
-        self.assertEqual(len(clone.reminders), len(default_profiles()[0].reminders))
-        self.assertNotEqual(clone.reminders[0].id, default_profiles()[0].reminders[0].id)
+        self.assertEqual(len(clone.primary.reminders), len(default_profiles()[0].primary.reminders))
+        self.assertNotEqual(clone.primary.reminders[0].id, default_profiles()[0].primary.reminders[0].id)
 
 
 class TestHelpers(unittest.TestCase):

@@ -1,20 +1,23 @@
 """提醒调度（纯状态机，可单元测试）。
 
-职责：把「引擎算出的剩余时间」翻译成「这一次刷新该不该响/该不该变色」。
-关键约束（来自需求）：
+职责：把「引擎算出的剩余时间」翻译成「这一次刷新该不该响 / 该用什么样式」。
 
-* 同一根 K 线的同一个提醒节点，只触发一次；
-* 去重键是「节点 id + 剩余秒数」：把节点的剩余秒数改了，等于换了个新节点，
-  会在新阈值处重新触发一次（否则调完参数就再也不响了）；
-* 刷新界面、切周期都不会重置已触发记录（只有换 K 线才重置）；
-* 休眠唤醒 / 长时间卡顿后恢复，不补响历史节点，避免一次叫醒四声。
+多周期规则
+----------
+* 每个周期各自去重：去重键是「周期 + 节点 id + 剩余秒数」，
+  同一根 30 分钟 K 线和同一根 5 分钟 K 线互不干扰；
+* 接管期间（:attr:`CountdownState.takeover` 不为 None），只有接管周期的提醒生效，
+  其余周期——包括主周期——的节点被**静默**：不出样式、不出声音，并且直接记为已触发，
+  避免接管结束后补响；
+* 改了节点的剩余秒数等于换了个新节点，会在新阈值处重新触发（调参数测试时不会「只闪不响」）；
+* 休眠唤醒 / 长时间卡顿后恢复不补响历史节点。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .engine import CountdownState
+from .engine import BarState, CountdownState
 from .models import ReminderRule
 
 
@@ -30,105 +33,116 @@ class ReminderEvent:
     rule: ReminderRule
     bar_key: str
     remaining_seconds: float
+    period_seconds: int = 0
 
 
 @dataclass
 class TickResult:
     bar_changed: bool = False
     events: list[ReminderEvent] = field(default_factory=list)
-    active_rules: list[ReminderRule] = field(default_factory=list)
+    active_rules: list[ReminderRule] = field(default_factory=list)  # 当前生效区间内的节点
+    style_bar: BarState | None = None       # 决定角标颜色的周期（接管者优先）
+    style_rule: ReminderRule | None = None  # 该周期当前生效的节点（None = 用周期自己的颜色）
     suppressed: int = 0
 
     @property
     def primary_rule(self) -> ReminderRule | None:
-        """最紧急（阈值最小）的生效节点，用于决定角标样式。"""
-        return self.active_rules[0] if self.active_rules else None
+        """兼容旧名字：当前应显示样式的规则。"""
+        return self.style_rule
 
 
 class ReminderScheduler:
-    """按 K 线维度去重的提醒状态机。
+    """按「周期 + K 线」维度去重的提醒状态机。"""
 
-    ``_fired_by_bar`` 保留最近若干根 K 线的已触发记录：
-    系统时钟被回拨、或用户把时间调回上一根 K 线时，也不会重复响铃。
-    """
-
-    MAX_BAR_HISTORY = 12
+    MAX_BAR_HISTORY = 64
 
     def __init__(self) -> None:
-        self._bar_key: str | None = None
-        self._fired_by_bar: dict[str, set[tuple[str, int]]] = {}
+        self._current: dict[int, str] = {}                  # 周期 -> 当前 bar_key
+        self._fired: dict[str, set[tuple[str, int]]] = {}   # bar_key -> 已触发节点
         self._suppress_next: bool = False
-        self.last_remaining: float | None = None
-
-    @property
-    def _fired(self) -> set[tuple[str, int]]:
-        """当前 K 线的已触发集合（自动创建）。"""
-        if self._bar_key is None:
-            return set()
-        return self._fired_by_bar.setdefault(self._bar_key, set())
 
     # ---- 生命周期 ----
 
     def reset(self) -> None:
-        self._bar_key = None
-        self._fired_by_bar.clear()
+        self._current.clear()
+        self._fired.clear()
         self._suppress_next = False
-        self.last_remaining = None
 
     def suppress_current_bar(self) -> None:
-        """休眠唤醒/恢复运行后调用：当前这根 K 线不再补响任何节点。"""
+        """休眠唤醒/恢复运行后调用：当前这几根 K 线不再补响任何节点。"""
         self._suppress_next = True
+
+    def _prune(self) -> None:
+        if len(self._fired) <= self.MAX_BAR_HISTORY:
+            return
+        keep = set(self._current.values())
+        for key in list(self._fired):
+            if key not in keep and len(self._fired) > self.MAX_BAR_HISTORY:
+                self._fired.pop(key, None)
 
     # ---- 每次刷新调用 ----
 
     def update(self, state: CountdownState) -> TickResult:
         result = TickResult()
-        bar_key = state.bar_key
-
-        if bar_key != self._bar_key:
-            self._bar_key = bar_key
-            result.bar_changed = True
-            self._fired_by_bar.setdefault(bar_key, set())
-            # 只保留最近若干根，避免长期运行内存增长
-            if len(self._fired_by_bar) > self.MAX_BAR_HISTORY:
-                for stale in list(self._fired_by_bar)[: -self.MAX_BAR_HISTORY]:
-                    if stale != bar_key:
-                        self._fired_by_bar.pop(stale, None)
-            if self._suppress_next:
-                # 刚恢复运行：吃掉当前区间内的节点，不补响
-                self._suppress_next = False
-                for rule in state.rules:
-                    if rule.enabled and 0 < state.remaining_seconds <= rule.threshold_seconds:
-                        self._fired.add(_rule_key(rule))
-                        result.suppressed += 1
-
-        self.last_remaining = state.remaining_seconds
-        if not state.is_trading:
-            result.active_rules = []
+        if not state.is_trading or state.primary is None:
             return result
 
-        rules = [r for r in state.rules if r.enabled and r.threshold_seconds > 0]
-        remaining = state.remaining_seconds
+        bars = state.all_bars()
+        takeover = state.takeover
 
-        eligible = [
-            r for r in rules if _rule_key(r) not in self._fired and 0 < remaining <= r.threshold_seconds
-        ]
-        # 生效区间按阈值从小到大（最紧急在前），供 UI 取样式
-        active = sorted(
-            [r for r in rules if 0 < remaining <= r.threshold_seconds],
-            key=lambda r: r.threshold_seconds,
-        )
-        result.active_rules = active
+        # 1) 换 K 线：每个周期各自检测，各自重置
+        for bar in bars:
+            if self._current.get(bar.period_seconds) != bar.bar_key:
+                self._current[bar.period_seconds] = bar.bar_key
+                result.bar_changed = True
+                if self._suppress_next:
+                    marks = [
+                        _rule_key(rule)
+                        for rule in bar.timeframe.reminders
+                        if rule.enabled and 0 < bar.remaining_seconds <= rule.threshold_seconds
+                    ]
+                    self._fired.setdefault(bar.bar_key, set()).update(marks)
+                    result.suppressed += len(marks)
+        if result.bar_changed:
+            self._suppress_next = False
+            self._prune()
 
-        if eligible:
-            # 一次刷新最多只响一个节点：取「最贴身的那个」，
-            # 其余更宽松的节点标记为已处理，避免启动/唤醒瞬间连响。
-            chosen = min(eligible, key=lambda r: r.threshold_seconds)
-            for rule in eligible:
-                self._fired.add(_rule_key(rule))
-            result.events.append(
-                ReminderEvent(rule=chosen, bar_key=bar_key, remaining_seconds=remaining)
+        # 2) 逐周期判定
+        for bar in bars:
+            fired = self._fired.setdefault(bar.bar_key, set())
+            rules = [r for r in bar.timeframe.reminders if r.enabled and r.threshold_seconds > 0]
+            active = sorted(
+                [r for r in rules if 0 < bar.remaining_seconds <= r.threshold_seconds],
+                key=lambda r: r.threshold_seconds,
             )
+            eligible = [r for r in active if _rule_key(r) not in fired]
+
+            # 接管期间：非接管周期的提醒全部静默（样式和声音都不出）
+            if takeover is not None and bar is not takeover:
+                for rule in eligible:
+                    fired.add(_rule_key(rule))
+                    result.suppressed += 1
+                continue
+
+            if eligible:
+                # 一次刷新最多只响一个节点：取「最贴身的那个」
+                chosen = min(eligible, key=lambda r: r.threshold_seconds)
+                for rule in eligible:
+                    fired.add(_rule_key(rule))
+                result.events.append(
+                    ReminderEvent(
+                        rule=chosen,
+                        bar_key=bar.bar_key,
+                        remaining_seconds=bar.remaining_seconds,
+                        period_seconds=bar.period_seconds,
+                    )
+                )
+
+            if bar is state.style_bar:
+                result.style_bar = bar
+                result.active_rules = active
+                result.style_rule = min(active, key=lambda r: r.threshold_seconds) if active else None
+
         return result
 
 

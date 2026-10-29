@@ -64,6 +64,7 @@ class App:
         self.settings: SettingsWindow | None = None
         self._last_flash = None
         self._flash_started_at: float | None = None
+        self._flash_rule_id: str | None = None
         self._tooltip_text: str = ""
         self._tooltip_updated: float = 0.0
 
@@ -165,7 +166,7 @@ class App:
                 TrayMenuItem(
                     id=self.CMD_PERIOD_BASE + seconds // 60,
                     label=label,
-                    checked=active.period_seconds == seconds,
+                    checked=active.active_period == seconds,
                 )
             )
         profile_children = []
@@ -237,8 +238,9 @@ class App:
             return
         if self.CMD_PERIOD_BASE <= command_id < self.CMD_PERIOD_BASE + 100:
             minutes = command_id - self.CMD_PERIOD_BASE
-            if minutes and minutes * 60 != profile.period_seconds:
-                profile.period_seconds = minutes * 60
+            if minutes and minutes * 60 != profile.active_period:
+                profile.activate(minutes * 60)
+                self.scheduler.reset()
                 self._commit()
             return
 
@@ -259,7 +261,7 @@ class App:
         # 周期：当前项前面打勾（不另起一行重复「当前周期」）
         menu.add_command(label="周期", state=tk.DISABLED)
         for seconds, label in PERIOD_MENU:
-            mark = "✓ " if active.period_seconds == seconds else "    "
+            mark = "✓ " if active.active_period == seconds else "    "
             menu.add_command(label=mark + label, command=lambda s=seconds: self._set_period(s))
         menu.add_separator()
 
@@ -293,9 +295,10 @@ class App:
 
     def _set_period(self, seconds: int) -> None:
         profile = self.cfg.active_profile()
-        if profile.period_seconds == seconds:
+        if profile.active_period == seconds:
             return
-        profile.period_seconds = seconds
+        profile.activate(seconds)
+        self.scheduler.reset()
         self._commit()
 
     def _toggle_lock(self) -> None:
@@ -404,47 +407,72 @@ class App:
 
         if self.cfg.global_mute:
             self.audio.stop()
-            active_rule = None  # 一键静音同时关闭闪烁
+            style_rule = None  # 一键静音同时关闭闪烁
         else:
             for event in result.events:
                 rule = event.rule
                 if rule.sound:
                     self.audio.play(rule.sound_source, rule.volume, rule.sound_repeat, rule.sound_interval)
-            active_rule = result.primary_rule
+            style_rule = result.style_rule
 
         appearance = self.cfg.appearance
+        profile = self.cfg.active_profile()
 
         if not state.is_trading:
             text = appearance.idle_text if not state.is_error else "ERR"
             self._flash_started_at = None
-            # 空闲态与交易态用同一套配色，避免两个状态来回跳色
+            self._flash_rule_id = None
+            # 空闲态沿用主周期的配色，避免两个状态来回跳色
+            primary = profile.primary
             self.badge.render(
-                BadgeVisual(text=text, fg=appearance.fg_color, bg=appearance.bg_color)
+                BadgeVisual(
+                    text=text,
+                    fg=primary.fg_color,
+                    bg=primary.bg_color,
+                    transparent=primary.transparent_bg,
+                )
             )
             return
 
         text = format_duration(state.remaining_seconds)
-        if active_rule is None:
+        # 接管时用接管周期的颜色；否则用主周期
+        bar = result.style_bar or state.primary
+        timeframe = bar.timeframe if bar is not None else profile.primary
+
+        if style_rule is None:
             self._flash_started_at = None
-            self.badge.render(BadgeVisual(text=text, fg=appearance.fg_color, bg=appearance.bg_color))
+            self._flash_rule_id = None
+            self.badge.render(
+                BadgeVisual(
+                    text=text,
+                    fg=timeframe.fg_color,
+                    bg=timeframe.bg_color,
+                    transparent=timeframe.transparent_bg,
+                )
+            )
             return
 
+        # 换了一条节点规则就重新计闪烁相位
+        if self._flash_rule_id != style_rule.id:
+            self._flash_rule_id = style_rule.id
+            self._flash_started_at = now.timestamp()
         if self._flash_started_at is None:
             self._flash_started_at = now.timestamp()
         elapsed = now.timestamp() - self._flash_started_at
-        if active_rule.flash_duration > 0 and elapsed > active_rule.flash_duration:
+        if style_rule.flash_duration > 0 and elapsed > style_rule.flash_duration:
             flash_on = False
         else:
-            flash_on = flash_phase(elapsed, active_rule.flash_hz)
+            flash_on = flash_phase(elapsed, style_rule.flash_hz)
 
         self.badge.render(
             BadgeVisual(
                 text=text,
-                fg=active_rule.fg_color,
-                bg=active_rule.bg_color,
-                flash_on=flash_on and bool(active_rule.flash),
-                flash_color=active_rule.flash_color,
-                flash_style=active_rule.flash_style,
+                fg=style_rule.fg_color,
+                bg=style_rule.bg_color,
+                transparent=timeframe.transparent_bg,
+                flash_on=flash_on and bool(style_rule.flash),
+                flash_color=style_rule.flash_color,
+                flash_style=style_rule.flash_style,
             )
         )
 
